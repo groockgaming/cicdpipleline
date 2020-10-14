@@ -3,14 +3,214 @@ version: 2.1
 orbs:
   python: circleci/python@1.0.0
 
-jobs:
-  hello-world:
-    docker: 
-      - image: cimg/node:14.10.1 # the primary container, where your job's commands are run
+commands:
+  add-ssh-keys:
+    description: Add ssh key to job
     steps:
-      - checkout # check out the code in the project directory
-      - run: echo "hello world" # run the `echo` command
+      - add_ssh_keys:
+          fingerprints:
+            - "	e3:dd:30:10:b4:ea:8f:58:06:6c:97:0b:98:32:85:1d"
+
+  create-env-file:
+    description: Command used for creating backend environment file
+    steps:
+      - run:
+          name: Add values to backend/env file
+          command: |
+            echo "NODE_ENV=development" >> backend/.env
+            echo "VERSION=1" >> backend/.env
+            echo "TYPEORM_CONNECTION=${TYPEORM_CONNECTION}" >> backend/.env
+            echo "TYPEORM_MIGRATIONS_DIR=${TYPEORM_MIGRATIONS_DIR}" >> backend/.env
+            echo "TYPEORM_ENTITIES=${TYPEORM_ENTITIES}" >> backend/.env
+            echo "TYPEORM_MIGRATIONS=${TYPEORM_MIGRATIONS}" >> backend/.env
+            echo "TYPEORM_HOST=${TYPEORM_HOST}" >> backend/.env
+            echo "TYPEORM_PORT=${TYPEORM_PORT}" >> backend/.env
+            echo "TYPEORM_USERNAME=${TYPEORM_USERNAME}" >> backend/.env
+            echo "TYPEORM_PASSWORD=${TYPEORM_PASSWORD}" >> backend/.env
+            echo "TYPEORM_DATABASE=${TYPEORM_DATABASE}" >> backend/.env
+
+  destroy-environment:
+    description: Command used for destroying the whole AWS infrastructure
+    steps:
+      - run:
+          when: on_fail
+          name: Delete all files in the current S3 bucket
+          command: |
+            if aws s3api head-bucket --bucket udapeople-${CIRCLE_WORKFLOW_ID:0:7}
+            then
+              aws s3 rm s3://udapeople-${CIRCLE_WORKFLOW_ID:0:7}/ --recursive
+            fi
+      - run:
+          when: on_fail
+          name: Destroy the CloudFormation Stacks
+          command: |
+            export TERM=xterm-color
+            aws cloudformation delete-stack --stack-name cloud-devops-frontend-${CIRCLE_WORKFLOW_ID:0:7}
+            aws cloudformation delete-stack --stack-name cloud-devops-backend-${CIRCLE_WORKFLOW_ID:0:7}
+            aws cloudformation delete-stack --stack-name cloud-devops-cloudfront
+  
+  revert-migration:
+    description: Revert the last migration if smoke tests are failing in the current workflow
+    steps:
+      - run:
+          when: on_fail
+          name: Install dependencies
+          command: |
+            curl -sL https://rpm.nodesource.com/setup_lts.x | bash -
+            yum -y install nodejs
+      - checkout
+      - create-env-file
+      - run:
+          when: on_fail
+          name: Load migration status from https://memstash.io/ and revert migrations if necessary
+          command: |
+            MIGRATION_STATUS=$(curl -H "token: 366941c3-dc41-4cb0-87ca-36961c6ef2c9" --request GET https://api.memstash.io/values/no_migrations_pending_<< pipeline.id >>)
+            echo ${MIGRATION_STATUS}
+            if [[ ${MIGRATION_STATUS} == 1 ]]
+            then
+              cd backend
+              npm install
+              npm run migrations:revert
+            fi
+jobs:
+  deploy-infrastructure:
+    docker:
+      - image: amazon/aws-cli
+    steps:
+      - checkout
+      - run: 
+          name: Create Backend Stack
+          command: |
+            aws cloudformation create-stack \
+            --template-body file://.circleci/files/backend.yml \
+            --stack-name cloud-devops-backend-${CIRCLE_WORKFLOW_ID:0:7} \
+            --parameters ParameterKey=ID,ParameterValue=${CIRCLE_WORKFLOW_ID:0:7}
+      - run:
+          name: Install dependencies
+          command: yum -y install tar gzip
+      - run:
+          name: Add Backend EC2 Instance DNS Name to Ansible Inventory
+          when: on_success
+          command: |
+            sleep 60
+            BACKEND_DNS_NAME=$(aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=backend-${CIRCLE_WORKFLOW_ID:0:7}" \
+              --query 'Reservations[*].Instances[*].PublicDnsName' \
+              --output text)
+            if [ -z "$BACKEND_DNS_NAME" ]; then
+              echo "BACKEND_DNS_NAME is empty"
+              exit 1
+            fi
+            echo "[backend]" > .circleci/ansible/inventory
+            echo ${BACKEND_DNS_NAME} >> .circleci/ansible/inventory
+      - persist_to_workspace:
+          root: ~/
+          paths:
+            - project/.circleci/ansible/inventory
+      - destroy-environment
+
+  configure-infrastructure:
+    executor: python/default
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/
+      - add-ssh-keys
+      - run:
+          name: Install Ansible
+          command: |
+            pip install ansible==2.9.12
+            ansible --version
+            pip install awscli
+      - run:
+          name: Run ansible-playbook for backend server
+          command: |
+            cd .circleci/ansible
+            ansible -u ubuntu -m ping backend -e 'ansible_python_interpreter=/usr/bin/python3'
+            ansible-playbook server-configuration.yaml -e 'ansible_python_interpreter=/usr/bin/python3'
+      - destroy-environment
+
+  run-migrations:
+    docker:
+      - image: circleci/node:13.8.0
+    steps:
+      - checkout
+      - create-env-file
+      - run:
+          name: Backend -> Run migrations and save status to https://memstash.io/
+          command: |
+            cd backend
+            npm install
+            npm run migrations > migrations.log
+            curl -H "Content-Type: text/plain" -H "token: 366941c3-dc41-4cb0-87ca-36961c6ef2c9" \
+              --request PUT \
+              --data $( grep -c "No migrations are pending" migrations.log ) \
+              https://api.memstash.io/values/no_migrations_pending_<< pipeline.id >>
+
+  deploy-backend:
+    executor: python/default
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/
+      - add-ssh-keys
+      - run:
+          command: |
+            sudo apt update
+            sudo apt install rsync
+      - run:
+          name: Install Ansible
+          command: |
+            pip install ansible==2.9.12
+            ansible --version
+            pip install awscli
+      - create-env-file
+      - run:
+          name: Run ansible-playbook for backend server
+          command: |
+            cd .circleci/ansible
+            ansible -u ubuntu -m ping backend -e 'ansible_python_interpreter=/usr/bin/python3'
+            ansible-playbook deploy-backend.yaml -e 'ansible_python_interpreter=/usr/bin/python3'
+      - revert-migration
+      - destroy-environment
+
+  smoke-test:
+    docker:
+      - image: amazon/aws-cli
+    steps:
+      - checkout
+      - create-env-file
+      - run:
+          name: Run smoke test on backend
+          command: |
+            BACKEND_DNS_NAME=$(aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=backend-${CIRCLE_WORKFLOW_ID:0:7}" \
+              --query 'Reservations[*].Instances[*].PublicDnsName' \
+              --output text)
+            if [ -z "$BACKEND_DNS_NAME" ]; then
+              echo "BACKEND_DNS_NAME is empty"
+              exit 1
+            fi
+            if curl -s "http://${BACKEND_DNS_NAME}:3030/api/status" | grep "ok"
+            then
+              exit 0
+            else
+              exit 1
+            fi
+      - revert-migration
+      - destroy-environment
+
 workflows:
   udapeople:
     jobs:
-      - hello-world
+      - deploy-infrastructure
+      - configure-infrastructure
+      - run-migrations:
+          requires:
+            - configure-infrastructure
+      - deploy-backend:
+          requires:
+            - run-migrations
+      - smoke-test:
+          requires:
+           - deploy-backend
