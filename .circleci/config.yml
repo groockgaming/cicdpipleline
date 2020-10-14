@@ -1,0 +1,16 @@
+version: 2.1
+
+orbs:
+  python: circleci/python@1.0.0
+
+jobs:
+  hello-world:
+    docker: 
+      - image: cimg/node:14.10.1 # the primary container, where your job's commands are run
+    steps:
+      - checkout # check out the code in the project directory
+      - run: echo "hello world" # run the `echo` command
+workflows:
+  udapeople:
+    jobs:
+      - hello-world
