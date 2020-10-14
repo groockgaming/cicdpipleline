@@ -204,8 +204,8 @@ workflows:
   udapeople:
     jobs:
       - deploy-infrastructure
-      - configure-infrastructure
-        requires:
+      - configure-infrastructure:
+          requires:
             - deploy-infrastructure
       - run-migrations:
           requires:
